@@ -8,6 +8,9 @@ from typing import Any
 
 from app.seed import SEED_ROWS
 
+# 内部表只服务于领域逻辑（原始样本、补采回执），不作为业务模块出现在概览里。
+INTERNAL_TABLES = {"ts_sample", "gap_receipt"}
+
 
 class Store:
     def __init__(self) -> None:
@@ -16,7 +19,9 @@ class Store:
         }
 
     def module_names(self) -> list[str]:
-        return sorted(self._tables)
+        return sorted(
+            name for name in self._tables if name not in INTERNAL_TABLES
+        )
 
     def rows(self, module: str) -> list[dict[str, Any]]:
         return self._tables.setdefault(module, [])

@@ -37,6 +37,8 @@
       <button class="btn ghost" data-testid="reset" type="button" @click="resetFilters">重置条件</button>
     </form>
 
+    <DownsamplePanel v-if="meta.key === 'downsample'" />
+
     <table class="data-table">
       <thead>
         <tr>
@@ -104,6 +106,7 @@ import {
   runAction as applyAction,
 } from '@/api/backend-service'
 import type { EntryRow } from '@/data/types'
+import DownsamplePanel from '@/views/DownsamplePanel.vue'
 
 const props = defineProps<{ moduleKey: string }>()
 const meta = moduleMeta(props.moduleKey)

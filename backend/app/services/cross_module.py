@@ -11,6 +11,16 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from app.store import store
+from app.services.data_gap import (
+    CST as GAP_CST,
+    WINDOW_CLAIMED,
+    WINDOW_RECEIVED,
+    canonical,
+    data_gap_service,
+    granularity_seconds,
+    parse_moment,
+    resolve_range,
+)
 
 CST = timezone(timedelta(hours=8))
 
@@ -296,112 +306,430 @@ class CrossModuleService:
     def downsample_with_gap_check(
         self, source_point: str, target_granularity: str, agg_function: str,
         time_start: str | None = None, time_end: str | None = None,
+        device_id: str | None = None, date: str | None = None,
+        time_range: str | None = None, request_id: str | None = None,
     ) -> dict[str, Any]:
         """降采样前先检查数据断点，存在断点则自动发起补采。
 
         业务流程：
-        1. 创建降采样任务
-        2. 检查源测点在该时间段是否有数据断点
-        3. 如有断点则自动创建补采记录
-        4. 关联降采样任务和补采记录
+        1. 解析申请里的日期与时段，得到 ``[开始时刻, 截止时刻)``
+        2. 只统计同一设备、同一测点、落在这个半开区间内的窗口
+        3. 创建降采样任务，并按待补区间向数据断点服务领取补采
+        4. 回填每个窗口的状态，供降采样详情页与补采工作台共用
         """
         downsample_rows = store.rows("downsample")
-        data_gap_rows = store.rows("data_gap")
 
-        # 步骤1：创建降采样任务
+        start_dt, end_dt = resolve_range(
+            date_value=date,
+            time_start=time_start,
+            time_end=time_end,
+            time_range=time_range,
+        )
+        if start_dt is None or end_dt is None:
+            # 申请里没有可解析的时段时，按申请日期（缺省今天）的整天检查，
+            # 绝不把「现在」当成用户填写的截止时刻。
+            day = parse_moment(date) if date else None
+            if day is None:
+                day = _now_dt().replace(hour=0, minute=0, second=0, microsecond=0)
+            day = day.replace(hour=0, minute=0, second=0, microsecond=0)
+            start_dt, end_dt = day, day + timedelta(days=1)
+        start = canonical(start_dt)
+        end = canonical(end_dt)
+        if device_id is None or str(device_id).strip() == "":
+            device_id = self._device_of_point(source_point) or ""
+        device_id = str(device_id or "").strip()
+
+        step_seconds = granularity_seconds(target_granularity, 300)
         max_id = max((int(row.get("id", 0)) for row in downsample_rows), default=0)
-        start = time_start or (_now_dt() - timedelta(hours=24)).isoformat(timespec="seconds")
-        end = time_end or _now()
+        task_id = max_id + 1
+        task_no = f"DOWN-{task_id:04d}"
+        request_id = (request_id or task_no).strip()
+
+        # 先创建任务占位，领取结果回填到同一行。
         task = {
-            "id": max_id + 1,
-            "任务编号": f"DOWN-{max_id + 1:04d}",
+            "id": task_id,
+            "任务编号": task_no,
+            "申请编号": request_id,
+            "设备编号": device_id,
             "源测点": source_point,
             "目标粒度": target_granularity,
             "聚合函数": agg_function,
             "源时间范围": f"{start} ~ {end}",
+            "开始时刻": start,
+            "截止时刻": end,
             "目标测点": f"{source_point}_ds",
             "执行状态": "待执行",
             "完成时间": "",
             "status": "待执行",
             "pending": True,
             "abnormal": False,
+            "领取轮次": 0,
+            "已领取区间": [],
         }
         downsample_rows.append(task)
 
-        # 步骤2：检查数据断点（模拟检测）
-        # 在源测点对应的设备上查找断点记录
-        related_gaps = [
-            row for row in data_gap_rows
-            if row.get("测点编号") == source_point
-            and row.get("status") in ("待补采", "补采中")
+        progress = data_gap_service.progress(
+            device_id, source_point, start_dt, end_dt, step_seconds
+        )
+        missing = [
+            item for item in progress if item.get("状态") != WINDOW_RECEIVED
         ]
+        missing_moments = [
+            parse_moment(item["时刻"]) for item in missing if item.get("时刻")
+        ]
+        claim = data_gap_service.claim_windows(
+            device_id, source_point,
+            [moment for moment in missing_moments if moment is not None],
+            request_id=request_id,
+            step_seconds=step_seconds,
+        )
+        task["领取轮次"] = 1 if claim["claimed"] else 0
+        task["已领取区间"] = claim["claimed_intervals"]
 
-        # 步骤3：模拟断点检测（基于时间窗口估算）
-        gap_count = len(related_gaps)
-        estimated_missing = 0
-        for gap in related_gaps:
-            try:
-                missing = int(gap.get("缺失点数", 0))
-            except (ValueError, TypeError):
-                missing = 0
-            estimated_missing += missing
-
-        # 如有断点且存在未完成的补采，启动补采
-        gap_result = None
-        if related_gaps:
-            gap = related_gaps[0]
-            gap["status"] = "补采中"
-            gap["pending"] = True
-            gap_result = {
-                "gap_id": gap.get("记录编号"),
-                "status": "补采中",
-                "missing_points": estimated_missing,
-            }
-
+        detail = self.downsample_detail(task_id, start_dt, end_dt, step_seconds)
+        detail_missing = detail["missing_count"] if detail else len(missing)
         return {
             "ok": True,
-            "message": f"降采样任务已创建，发现 {gap_count} 条断点记录",
+            "message": (
+                f"降采样任务已创建，{device_id or '未知设备'} 测点 {source_point} "
+                f"在 {start} ~ {end} 内按 {target_granularity} 有 "
+                f"{detail_missing} 个待补区间"
+            ),
+            "request_id": request_id,
+            "device_id": device_id,
+            "start": start,
+            "end": end,
+            "granularity": target_granularity,
+            "step_seconds": step_seconds,
             "downsample_task": task,
-            "gap_result": gap_result,
-            "estimated_missing": estimated_missing,
+            "gap_result": {
+                "status": WINDOW_CLAIMED if claim["claimed"] else "无待补区间",
+                "claimed_intervals": claim["claimed_intervals"],
+                "claimed": claim["claimed"],
+                "missing_points": len(missing),
+            },
+            "progress": progress,
+            "missing": missing,
+            "estimated_missing": len(missing),
+            "detail": detail,
         }
 
-    def trigger_gap_recovery(self, device_id: str, point_id: str) -> dict[str, Any]:
-        """显式触发断点补采，基于设备上下线和降采样历史判断。
+    def gap_workbench(self) -> dict[str, Any]:
+        """补采工作台：汇总各降采样申请里仍缺的区间。
 
-        业务流程：
-        1. 查找设备状态
-        2. 查找该测点的断点记录
-        3. 查找降采样任务关联
-        4. 发起补采
+        每一行都来自 ``downsample_detail`` 的实际测点计算结果，不再使用
+        data_gap 表里跨设备、跨时段混在一起的断点数量。
         """
-        data_gap_rows = store.rows("data_gap")
-        downsample_rows = store.rows("downsample")
+        applications: list[dict[str, Any]] = []
+        ranges: list[dict[str, Any]] = []
+        for task in store.rows("downsample"):
+            task_start, task_end = self._task_window(task)
+            if task_start is None or task_end is None:
+                continue
+            detail = self.downsample_detail(task.get("id"))
+            if detail is None or detail["missing_count"] == 0:
+                continue
+            applications.append({
+                "task_id": detail["task_id"],
+                "任务编号": detail["任务编号"],
+                "申请编号": detail["申请编号"],
+                "设备编号": detail["设备编号"],
+                "测点编号": detail["测点编号"],
+                "开始时刻": detail["开始时刻"],
+                "截止时刻": detail["截止时刻"],
+                "目标粒度": detail["目标粒度"],
+                "缺失点数": detail["missing_count"],
+                "已领取数量": detail["已领取数量"],
+                "已收数量": detail["已收数量"],
+                "执行状态": detail["execution_status"],
+            })
+            for item in detail["待补区间"]:
+                ranges.append({
+                    "task_id": detail["task_id"],
+                    "任务编号": detail["任务编号"],
+                    "申请编号": detail["申请编号"],
+                    "设备编号": detail["设备编号"],
+                    "测点编号": detail["测点编号"],
+                    "时刻": item["时刻"],
+                    "时隙": item["时隙"],
+                    "状态": item["状态"],
+                    "领取轮次": item.get("领取轮次", 0),
+                })
+        return {
+            "applications": applications,
+            "ranges": ranges,
+            "pending_count": len(ranges),
+            "generated_at": _now(),
+        }
 
-        # 查找相关降采样任务
-        related_tasks = [
-            row for row in downsample_rows
-            if row.get("源测点") == point_id and row.get("status") == "已完成"
+    def _device_of_point(self, point_id: str) -> str | None:
+        for row in store.rows("ts_point"):
+            if str(row.get("测点编号")) == str(point_id):
+                return str(row.get("设备编号") or "") or None
+        return None
+
+    def _find_task(self, task_ref: str | int) -> dict[str, Any] | None:
+        rows = store.rows("downsample")
+        text = str(task_ref)
+        for row in rows:
+            if str(row.get("id")) == text or str(row.get("任务编号")) == text:
+                return row
+        for row in rows:
+            if str(row.get("申请编号") or "") == text:
+                return row
+        return None
+
+    def _task_window(
+        self, task: dict[str, Any]
+    ) -> tuple[datetime | None, datetime | None]:
+        start = parse_moment(task.get("开始时刻"))
+        end = parse_moment(task.get("截止时刻"))
+        if start is not None and end is not None:
+            return start, end
+        raw = str(task.get("源时间范围") or "")
+        if "~" in raw:
+            left, right = raw.split("~", 1)
+            start, end = resolve_range(time_start=left.strip(), time_end=right.strip())
+            return start, end
+        return resolve_range(time_range=raw)
+
+    def downsample_detail(
+        self,
+        task_ref: str | int,
+        start_dt: datetime | None = None,
+        end_dt: datetime | None = None,
+        step_seconds: int = 600,
+    ) -> dict[str, Any] | None:
+        """降采样申请详情：逐窗口状态、真正待补范围与各自归属的回执。"""
+        task = self._find_task(task_ref)
+        if task is None:
+            return None
+        task_start, task_end = self._task_window(task)
+        start_dt = start_dt or task_start
+        end_dt = end_dt or task_end
+        if start_dt is None or end_dt is None:
+            return None
+
+        device_id = str(task.get("设备编号") or self._device_of_point(str(task.get("源测点"))) or "")
+        point_id = str(task.get("源测点") or "")
+        step_seconds = granularity_seconds(task.get("目标粒度"), step_seconds)
+
+        progress = data_gap_service.progress(
+            device_id, point_id, start_dt, end_dt, step_seconds
+        )
+        missing = [item for item in progress if item.get("状态") != WINDOW_RECEIVED]
+        claimed = [item for item in progress if item.get("状态") == WINDOW_CLAIMED]
+        received = [item for item in progress if item.get("状态") == WINDOW_RECEIVED]
+
+        receipts = data_gap_service.receipts_for(
+            device_id, point_id, start_dt, end_dt
+        )
+        applied_receipts = [item for item in receipts if item.get("matches_request")]
+        unrelated = [item for item in receipts if not item.get("matches_request")]
+
+        samples = data_gap_service.samples_between(
+            device_id, point_id, start_dt, end_dt
+        )
+        sample_points = [
+            {
+                "时刻": canonical(item["_moment"]),
+                "数值": item.get("数值", ""),
+                "来源": item.get("来源", ""),
+            }
+            for item in samples
         ]
 
-        # 查找断点记录
-        gaps = [
-            row for row in data_gap_rows
-            if row.get("设备编号") == device_id and row.get("测点编号") == point_id
-        ]
-
-        if not gaps:
-            return {"ok": False, "message": f"设备 {device_id} 测点 {point_id} 无断点记录"}
-
-        # 发起补采
-        gap = gaps[0]
-        gap["status"] = "补采中"
-        gap["pending"] = True
+        completed = len(missing) == 0
+        if completed:
+            task["执行状态"] = "已完成"
+            task["status"] = "已完成"
+            task["pending"] = False
+            task["完成时间"] = task.get("完成时间") or _now()
+        else:
+            if task.get("执行状态") in ("已完成", "数据不足"):
+                task["执行状态"] = "执行中"
+                task["status"] = "执行中"
+                task["pending"] = True
+            task["完成时间"] = ""
 
         return {
             "ok": True,
-            "message": f"已发起断点补采：{gap.get('记录编号')}",
-            "gap_entry": gap,
+            "task_id": task.get("id"),
+            "任务编号": task.get("任务编号"),
+            "申请编号": task.get("申请编号") or task.get("任务编号"),
+            "设备编号": device_id,
+            "测点编号": point_id,
+            "开始时刻": canonical(start_dt),
+            "截止时刻": canonical(end_dt),
+            "目标粒度": task.get("目标粒度"),
+            "窗口数": len(progress),
+            "已收数量": len(received),
+            "已领取数量": len(claimed),
+            "缺失点数": len(missing),
+            "missing_count": len(missing),
+            "device_id": device_id,
+            "待补区间": [
+                {
+                    "时刻": item["时刻"],
+                    "时隙": item["时隙"],
+                    "状态": item["状态"],
+                    "领取轮次": item.get("领取轮次", 0),
+                }
+                for item in missing
+            ],
+            "progress": progress,
+            "receipts": applied_receipts,
+            "unrelated_receipts": unrelated,
+            "sample_points": sample_points,
+            "execution_status": task.get("执行状态"),
+            "completed": completed,
+            "can_complete": completed,
+        }
+
+    def claim_downsample_gaps(
+        self, task_ref: str | int, request_id: str | None = None,
+    ) -> dict[str, Any]:
+        """续办补采：只领取当前申请里仍然缺的区间。"""
+        task = self._find_task(task_ref)
+        if task is None:
+            return {"ok": False, "message": f"降采样申请 {task_ref} 不存在"}
+        start_dt, end_dt = self._task_window(task)
+        if start_dt is None or end_dt is None:
+            return {"ok": False, "message": "申请缺少可识别的时段"}
+        device_id = str(task.get("设备编号") or self._device_of_point(str(task.get("源测点"))) or "")
+        point_id = str(task.get("源测点") or "")
+        step_seconds = granularity_seconds(task.get("目标粒度"), 600)
+
+        progress = data_gap_service.progress(
+            device_id, point_id, start_dt, end_dt, step_seconds
+        )
+        missing = [
+            parse_moment(item["时刻"])
+            for item in progress
+            if item.get("状态") != WINDOW_RECEIVED
+        ]
+        # 续办是一次新的领取轮次：沿用申请编号 + 轮次后缀，上一轮迟到的回执
+        # 会因「轮次更旧」被识别为冲突，但仍按采样时刻归位。
+        if request_id is None or str(request_id).strip() == "":
+            next_round = int(task.get("领取轮次", 0) or 0) + 1
+            request_id = f"{task.get('任务编号')}-R{next_round}"
+        request_id = str(request_id).strip()
+        claim = data_gap_service.claim_windows(
+            device_id, point_id,
+            [moment for moment in missing if moment is not None],
+            request_id=request_id,
+            step_seconds=step_seconds,
+        )
+        if claim["claimed"]:
+            task["领取轮次"] = int(task.get("领取轮次", 0) or 0) + 1
+            merged = list(task.get("已领取区间") or [])
+            for moment in claim["claimed_intervals"]:
+                if moment not in merged:
+                    merged.append(moment)
+            task["已领取区间"] = merged
+        detail = self.downsample_detail(task.get("id"), start_dt, end_dt, step_seconds)
+        return {
+            **claim,
+            "task_id": task.get("id"),
+            "任务编号": task.get("任务编号"),
+            "detail": detail,
+        }
+
+    def receive_backfill_receipt(
+        self,
+        device_id: str,
+        point_id: str,
+        timestamp: str,
+        value: Any = None,
+        receipt_id: str = "",
+        request_id: str = "",
+        round_no: int | str | None = None,
+        source: str = "补采",
+        remark: str = "",
+    ) -> dict[str, Any]:
+        """把补采签收交给数据断点服务，并回带受影响申请的最新缺口。"""
+        result = data_gap_service.receive_receipt(
+            device_id, point_id, timestamp, value,
+            receipt_id=receipt_id,
+            request_id=request_id,
+            round_no=round_no,
+            source=source,
+            remark=remark,
+        )
+        moment = parse_moment(timestamp)
+        details = []
+        if moment is not None:
+            for task in store.rows("downsample"):
+                if str(task.get("设备编号") or "") != str(device_id):
+                    continue
+                if str(task.get("源测点") or "") != str(point_id):
+                    continue
+                task_start, task_end = self._task_window(task)
+                if task_start is None or task_end is None:
+                    continue
+                if not (task_start <= moment < task_end):
+                    continue
+                detail = self.downsample_detail(task.get("id"))
+                if detail is not None:
+                    details.append(detail)
+        result["task_details"] = details
+        return result
+
+    def trigger_gap_recovery(
+        self, device_id: str, point_id: str,
+        date: str | None = None,
+        time_start: str | None = None,
+        time_end: str | None = None,
+        time_range: str | None = None,
+        target_granularity: str | None = None,
+    ) -> dict[str, Any]:
+        """显式触发断点补采：按设备与测点的待补区间领取。
+
+        业务流程：
+        1. 解析目标时段（未给出时回落到当天 00:00 ~ 次日 00:00）
+        2. 只用该设备、该测点的样本判断缺口
+        3. 按待补区间领取补采
+        """
+        start_dt, end_dt = resolve_range(
+            date_value=date,
+            time_start=time_start,
+            time_end=time_end,
+            time_range=time_range,
+        )
+        if start_dt is None or end_dt is None:
+            fallback = _now_dt().replace(hour=0, minute=0, second=0, microsecond=0)
+            start_dt, end_dt = fallback, fallback + timedelta(days=1)
+        step_seconds = granularity_seconds(
+            target_granularity or "10m", 600
+        )
+        related_tasks = [
+            row for row in store.rows("downsample")
+            if row.get("源测点") == point_id and row.get("status") == "已完成"
+        ]
+        progress = data_gap_service.progress(
+            device_id, point_id, start_dt, end_dt, step_seconds
+        )
+        missing = [
+            parse_moment(item["时刻"])
+            for item in progress
+            if item.get("状态") != WINDOW_RECEIVED
+        ]
+        if not missing:
+            return {
+                "ok": False,
+                "message": f"设备 {device_id} 测点 {point_id} 在 {canonical(start_dt)} ~ "
+                           f"{canonical(end_dt)} 内没有待补区间",
+                "related_downsample_tasks": len(related_tasks),
+            }
+        claim = data_gap_service.claim_windows(
+            device_id, point_id,
+            [moment for moment in missing if moment is not None],
+            request_id=f"RECOVER-{device_id}-{point_id}",
+            step_seconds=step_seconds,
+        )
+        return {
+            **claim,
+            "message": f"已发起断点补采：设备 {device_id} 测点 {point_id} 领取 {len(claim['claimed'])} 个区间",
             "related_downsample_tasks": len(related_tasks),
         }
 
